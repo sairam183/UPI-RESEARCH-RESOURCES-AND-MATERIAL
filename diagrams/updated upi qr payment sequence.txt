@@ -1,0 +1,177 @@
+sequenceDiagram
+    autonumber
+
+    actor USER as User / Payer
+    participant GPAY as Google Pay
+    participant CL as NPCI Common Library
+    participant KS as Android Keystore
+    participant PSP as Payer PSP
+    participant NPCI as NPCI UPI Switch
+    participant NHSM as NPCI HSM
+    participant VREG as NPCI VPA Registry
+    participant PAYER as Payer Bank UPI
+    participant PHSM as Payer Bank HSM
+    participant CBS1 as Payer Bank CBS
+    participant PAYEE as Payee PSP
+    participant CBS2 as Payee Bank CBS
+    actor MERCHANT as Merchant
+
+    Note over USER,KS: PHASE 0 — APP LAUNCH & SECURITY
+
+    USER->>GPAY: Open Google Pay
+    GPAY->>GPAY: Root / jailbreak detection
+    GPAY->>KS: Play Integrity attestation
+    KS-->>GPAY: Signed device-integrity verdict
+    GPAY->>GPAY: Developer options / USB debugging check
+    GPAY->>GPAY: Frida / DI detection
+    GPAY->>GPAY: Screen-sharing detection
+    GPAY->>GPAY: App lock / biometric / Google PIN
+
+    Note over USER,GPAY: PHASE 1 — QR SCAN & DECODE
+
+    USER->>GPAY: Tap Scan QR
+    GPAY->>GPAY: CameraX captures frame
+    GPAY->>GPAY: ML Kit BarcodeScanning
+    GPAY->>GPAY: Decode UPI URI
+    GPAY->>GPAY: Discard camera frame
+
+    Note right of GPAY: QR fields:<br/>pa, pn, mc, tr, am, cu, sign
+
+    Note over GPAY: PHASE 2 — LOCAL VALIDATION
+
+    GPAY->>GPAY: Parse QR URI
+    GPAY->>GPAY: Validate VPA / currency / amount
+    GPAY->>GPAY: Lookup PSP handle
+    GPAY->>GPAY: Verify UPI signature
+    GPAY->>GPAY: PASS / FAIL / WARNING
+
+    Note over GPAY,VREG: PHASE 3 — VPA RESOLUTION
+
+    GPAY->>PSP: VPA verification request
+    PSP->>NPCI: ReqValAdd
+    NPCI->>NPCI: Validate mTLS + RSA signature
+    NPCI->>VREG: Lookup Payee VPA
+    VREG-->>NPCI: Authoritative name + ACTIVE status
+    NPCI->>PAYEE: Payee liveness query
+    PAYEE-->>NPCI: VPA ACTIVE
+    NPCI-->>PSP: RespValAdd
+    PSP-->>GPAY: Verified payee name
+
+    Note over USER,GPAY: PHASE 4 — HUMAN CONFIRMATION
+
+    GPAY->>USER: Display verified payee name + amount
+    USER->>GPAY: Confirm / Pay Now
+
+    Note over GPAY,NHSM: PHASE 5–7 — SESSION ESTABLISHMENT
+
+    GPAY->>PSP: Request transaction session
+    PSP->>PSP: Generate Txn ID + nonce + Trust
+    PSP-->>GPAY: Salt + Trust + XML payload
+
+    GPAY->>CL: getCredential()
+    CL->>CL: Validate Trust
+    CL->>CL: Generate k0 + token
+    CL->>CL: Encrypt k0 + token
+    CL->>CL: Generate ephemeral RSA key
+    CL->>CL: Build challenge
+
+    CL-->>GPAY: Challenge
+    GPAY->>PSP: Forward challenge
+    PSP->>NPCI: GetToken
+    NPCI->>NHSM: Decrypt challenge
+    NHSM-->>NPCI: token + k0 + deviceId
+    NPCI-->>PSP: Token response
+    PSP-->>GPAY: Token response
+    GPAY->>CL: Relay token response
+    CL->>CL: Verify device binding
+
+    Note over USER,CL: PHASE 8 — UPI PIN ENTRY
+
+    CL->>CL: Security / overlay checks
+    CL->>USER: Launch isolated PIN activity
+    USER->>CL: Enter UPI PIN
+
+    Note over CL: PHASE 9 — CREDENTIAL CONSTRUCTION
+
+    CL->>CL: Build transaction pipe string
+    CL->>CL: SHA-256(transaction context)
+    CL->>CL: AES-256-GCM encrypt digest
+    CL->>CL: Build intermediate credential
+    CL->>CL: RSA-OAEP encrypt with NPCI public key
+    CL->>CL: Zero PIN from memory
+
+    CL-->>GPAY: Opaque encrypted credential
+
+    Note over GPAY,NPCI: PHASE 10 — ReqPay TRANSMISSION
+
+    GPAY->>PSP: Encrypted transaction request
+    PSP->>PSP: Build ReqPay XML
+    PSP->>PSP: RSA-SHA256 sign XML
+    PSP->>NPCI: ReqPay over mutual TLS
+
+    Note over NPCI,PAYEE: PHASE 11 — NPCI SWITCH PROCESSING
+
+    NPCI->>NPCI: Validate certificate + signature
+    NPCI->>NPCI: Schema + duplicate transaction check
+    NPCI->>NPCI: Risk / FRM evaluation
+
+    NPCI->>NHSM: Forward encrypted credential
+    NHSM->>NHSM: RSA-OAEP decrypt
+    NHSM->>NHSM: Verify Txn ID binding
+    NHSM->>NHSM: AES-GCM decrypt
+    NHSM->>NHSM: Recompute transaction digest
+    NHSM->>NHSM: Re-encrypt PIN with payer-bank key
+    NHSM-->>NPCI: Encrypted bank PIN block
+
+    NPCI->>PAYEE: Resolve payee account
+    PAYEE-->>NPCI: IFSC + account number
+
+    Note over PAYER,CBS1: PHASE 12 — PAYER BANK AUTH + DEBIT
+
+    NPCI->>PAYER: Debit request
+    PAYER->>PAYER: Check UPI account status
+    PAYER->>PHSM: Route encrypted PIN
+    PHSM->>PHSM: Decrypt PIN
+    PHSM->>PHSM: Verify PIN hash
+    PHSM-->>PAYER: Authentication result
+
+    PAYER->>CBS1: Balance + limit check
+    CBS1-->>PAYER: Balance sufficient
+    PAYER->>CBS1: Debit account
+    CBS1-->>PAYER: Debit confirmed
+    PAYER-->>NPCI: DebitSuccess
+
+    Note over NPCI,CBS2: PHASE 13 — PAYEE CREDIT
+
+    NPCI->>CBS2: Credit request
+    CBS2->>CBS2: Validate account
+    CBS2->>CBS2: Post credit
+    CBS2-->>NPCI: Credit confirmed
+
+    Note over NPCI,GPAY: PHASE 14 — RESPONSE PROPAGATION
+
+    NPCI-->>PSP: RespPay SUCCESS
+    NPCI->>PAYEE: Transaction confirmation
+    PAYEE-->>NPCI: Confirmation response
+
+    PSP->>PSP: Store transaction response
+    GPAY->>PSP: Query transaction status
+    PSP-->>GPAY: SUCCESS + transaction details
+
+    Note over GPAY,MERCHANT: PHASE 15 — MERCHANT RESPONSE
+
+    GPAY->>GPAY: Create signed tezResponse
+    GPAY->>MERCHANT: tezResponse + signature
+    MERCHANT->>MERCHANT: Verify signature
+    MERCHANT->>MERCHANT: Cross-check transaction
+
+    Note over USER,GPAY: PHASE 16 — SUCCESS + STORAGE
+
+    GPAY->>USER: Payment Successful
+    GPAY->>GPAY: Encrypt local transaction record
+    GPAY->>GPAY: Async backend transaction storage
+
+    Note over PAYER,CBS2: PHASE 17 — ASYNCHRONOUS NOTIFICATIONS
+
+    CBS1->>USER: Debit SMS
+    CBS2->>MERCHANT: Credit notification

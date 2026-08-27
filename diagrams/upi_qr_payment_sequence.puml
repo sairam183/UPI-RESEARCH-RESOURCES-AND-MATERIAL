@@ -1,0 +1,588 @@
+@startuml UPI_QR_Payment_Complete_Flow
+!theme plain
+skinparam backgroundColor #FEFEFE
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceGroupBackgroundColor #F0F4FF
+skinparam sequenceGroupBorderColor #4A6FA5
+skinparam sequenceLifeLineBorderColor #555555
+skinparam sequenceParticipantBackgroundColor #E8EEF8
+skinparam sequenceParticipantBorderColor #4A6FA5
+skinparam noteBorderColor #CC8800
+skinparam noteBackgroundColor #FFFDE7
+skinparam sequenceBoxBackgroundColor #F5F5F5
+skinparam sequenceBoxBorderColor #AAAAAA
+skinparam defaultFontSize 11
+skinparam defaultFontName Arial
+
+title UPI QR Payment — Complete Technical Flow\n(Google Pay → PSP → NPCI → Banks)\nAll cryptographic, protocol, and entity details
+
+' ══════════════════════════════════════════════
+' PARTICIPANT DECLARATIONS
+' ══════════════════════════════════════════════
+
+actor       "User\n(Payer)"                  as USER
+box "On-Device" #EEF2FF
+  participant "Google Pay App\ncom.google.android\n.apps.nbu.paisa.user\n(TPAP)" as GPAY
+  participant "NPCI Common\nLibrary (CL)\norg.npci.upi.security\n.pinactivitycomponent\n[ProGuard JAR]" as CL
+  participant "Android\nKeystore\n(TEE/StrongBox)" as KS
+end box
+
+box "PSP Backend" #FFF3E0
+  participant "Payer PSP\n(e.g. Axis Bank\nUPI Switch)\n@okaxis" as PSP
+end box
+
+box "NPCI Infrastructure" #E8F5E9
+  participant "NPCI\nUPI Switch\n(Hub)" as NPCI
+  participant "NPCI\nHSM\n(FIPS 140-2\nL3)" as NHSM
+  participant "NPCI\nVPA Registry\n(Central Mapper)" as VPA_REG
+end box
+
+box "Payer Bank" #FFF8E1
+  participant "Payer Bank\nUPI Module\n(e.g. HDFC)" as PAYER_UPI
+  participant "Payer Bank\nHSM\n(PIN verify)" as PAYER_HSM
+  participant "Payer Bank\nCBS\n(debit exec)" as PAYER_CBS
+end box
+
+box "Payee Side" #F3E5F5
+  participant "Payee PSP\n(e.g. HDFC\n@okhdfcbank)" as PAYEE_PSP
+  participant "Payee Bank\nCBS\n(credit exec)" as PAYEE_CBS
+end box
+
+actor       "Beneficiary\n(Merchant)"        as MERCHANT
+
+' ══════════════════════════════════════════════
+' PHASE 0: APP LAUNCH & DEVICE STATE CHECKS
+' ══════════════════════════════════════════════
+
+== PHASE 0: App Launch & Security Checks ==
+
+USER -> GPAY : Opens Google Pay app
+
+group Security Checks [MANDATORY — NPCI/2025-26/IS/003]
+  GPAY -> GPAY : Root / jailbreak detection\n(Magisk, su binary, build tags)
+  GPAY -> KS   : Play Integrity API attestation request\n[MEETS_DEVICE_INTEGRITY verdict]
+  KS  --> GPAY : Signed attestation verdict\n(hardware-backed on Titan M / TEE)
+  GPAY -> GPAY : Emulator detection check
+  GPAY -> GPAY : Developer options / USB debug check\n(mandatory block per NPCI-CIRC)
+  GPAY -> GPAY : Frida / dynamic instrumentation detection\n(recommended per NPCI-CIRC)
+  GPAY -> GPAY : Screen-sharing detection (Android 11+)\n→ warns if active during unknown call
+end
+
+GPAY -> GPAY : App lock gate\n(biometric / 4-digit Google PIN)\n[Keystore-gated key]
+note right of GPAY
+  **Data at rest (local SQLite):**
+  Encrypted with AES-256-GCM
+  Key alias: "bhim_sk" pattern
+  Stored in AndroidKeyStore (TEE)
+  Key never leaves Keystore boundary
+end note
+
+GPAY -> PSP  : Background session refresh\n[HTTPS/TLS 1.3, cert-pinned]\nFetch: Salt config, session token TTL check
+
+' ══════════════════════════════════════════════
+' PHASE 1: QR SCAN
+' ══════════════════════════════════════════════
+
+== PHASE 1: QR Scan & Decode (On-Device, No Network) ==
+
+USER -> GPAY : Taps "Scan QR" / "Pay"
+GPAY -> GPAY : Opens CameraX ImageAnalysis\n(STRATEGY_KEEP_ONLY_LATEST)\nYUV_420_888 frames → ImageProxy
+
+loop Camera analysis frames [until QR found]
+  GPAY -> GPAY : ML Kit BarcodeScanning (on-device)\nor ZXing (fallback)\n→ decodes QR matrix locally
+end
+
+GPAY -> GPAY : ImageProxy.close() — frame discarded\n**Camera frames NEVER transmitted**
+
+note right of GPAY
+  **QR URI extracted (example):**
+  upi://pay
+    ?pa=merchant@okhdfcbank  ← Payee VPA
+    &pn=Chai%20Stop          ← Payee name (UNTRUSTED)
+    &mc=5814                 ← MCC (fast food)
+    &tr=CHAI20260826001      ← Merchant order ref
+    &tn=Order%20%2312345     ← Transaction note
+    &am=149.00               ← Amount
+    &cu=INR                  ← Currency
+    &mode=01                 ← Static QR
+    &sign=<Base64RSAsig>     ← UPI 2.0 signature
+    &orgid=000000
+end note
+
+' ══════════════════════════════════════════════
+' PHASE 2: LOCAL VALIDATION
+' ══════════════════════════════════════════════
+
+== PHASE 2: Local Validation (On-Device, No Network) ==
+
+GPAY -> GPAY : Uri.parse() → extract all parameters\npa, pn, mc, tr, tn, am, cu, mode, sign
+
+group Local Format Validation [No network required]
+  GPAY -> GPAY : pa: contains exactly one '@'?\nValid character set? Max 255 chars?
+  GPAY -> GPAY : cu == "INR"?
+  GPAY -> GPAY : am: valid positive decimal ≤ 2dp?
+  GPAY -> GPAY : Lookup 'pa' handle suffix in\ncached ReqListPsp table\n→ identifies Payee PSP + bank locally\n(sub-millisecond)
+end
+
+group UPI 2.0 Signature Verification [If 'sign' parameter present]
+  GPAY -> GPAY : Extract orgid from QR
+  GPAY -> GPAY : Look up merchant public key\nfrom cached ManageVAE / ListKeys\n(daily refresh at 6 AM)
+  GPAY -> GPAY : Verify: SHA256withRSA(\n  URI_string_excluding_sign,\n  Base64.decode(sign),\n  merchant_public_key\n)
+  note right of GPAY
+    **If PASS:** Bypass passcode pre-screen
+    **If FAIL:** "Intent tampered/corrupt" → ABORT
+    **If absent:** "Source unverified" warning shown
+  end note
+end
+
+' ══════════════════════════════════════════════
+' PHASE 3: VPA RESOLUTION
+' ══════════════════════════════════════════════
+
+== PHASE 3: VPA Resolution — ReqValAdd / RespValAdd ==
+
+GPAY -> PSP : POST /api/v4/vpas/verify\n[HTTPS/TLS 1.3, cert-pinned]\nBody: AES-256-GCM encrypted JSON\n{ payeeVpa: "merchant@okhdfcbank",\n  payerVpa: "user@okaxis",\n  amount: "149.00" }\nencryptedKey: RSA-OAEP(NPCI_pub, AES_key+IV)\n**App-layer encryption beyond TLS**
+
+PSP -> PSP : Generate Txn.id (UUID v4, 35-char)\nGenerate Head.msgId (35-char)\nAssemble ReqValAdd XML
+
+PSP -> NPCI : ReqValAdd XML\n[Mutual TLS, IDRBT CA cert]\n[RSA-SHA256 message signature]\nPOST /upi/ValAdd/1.0/urn:txnid:<id>
+note right of PSP
+  **ReqValAdd XML (PSP → NPCI):**
+  <Head orgId="AXS0000001"
+        msgId="AXS2026..."/>
+  <Txn type="ValAdd"
+       id="AXS20260826T001"/>
+  <Payer addr="user@okaxis"
+         name="Rahul Sharma"/>
+  <Payee addr="merchant@okhdfcbank"
+         name="Chai Stop"/>
+  [Payee.name from QR 'pn' = UNTRUSTED INPUT]
+end note
+
+NPCI -> NPCI : Validate PSP mTLS certificate\nValidate RSA-SHA256 message signature\nValidate orgId == cert subject
+
+NPCI -> VPA_REG : Lookup "merchant@okhdfcbank"\n→ registry query (internal)
+VPA_REG --> NPCI : maskName="Chai Stop Pvt Ltd"\nstatus=ACTIVE, type=ENTITY, MCC=5814\n(from KYC record at VPA registration)
+
+NPCI -> PAYEE_PSP : Internal liveness query\n"Is merchant@okhdfcbank currently active?"
+PAYEE_PSP --> NPCI : Confirmed ACTIVE\n(from Payee PSP's own registry)
+
+NPCI -> PSP : RespValAdd\n[Mutual TLS, signed by NPCI]
+note right of NPCI
+  **RespValAdd XML (NPCI → PSP):**
+  <Resp reqMsgId="AXS2026..."
+        result="SUCCESS"
+        errCode=""
+        maskName="Chai Stop Pvt Ltd"/>
+  [maskName = NPCI VPA Registry value]
+  [NOT the QR 'pn' field — that is untrusted]
+end note
+
+PSP -> PSP : Store RespValAdd in\nTPAP/channel response table
+PSP --> GPAY : Query Service response\n{ payeeName: "Chai Stop Pvt Ltd",\n  status: "verified",\n  payeeType: "ENTITY" }
+
+' ══════════════════════════════════════════════
+' PHASE 4: CONFIRMATION SCREEN
+' ══════════════════════════════════════════════
+
+== PHASE 4: Recipient Confirmation Screen ==
+
+GPAY -> USER : Display payment confirmation screen:
+note right of USER
+  **Payment Confirmation Screen:**
+  Pay ₹149.00 to
+  **Chai Stop Pvt Ltd** [✓ Business]  ← maskName from NPCI
+  merchant@okhdfcbank                 ← Payee VPA (from QR 'pa')
+  Order #12345                        ← from QR 'tn'
+  Debit from: HDFC Bank ••4321        ← from local RespListAccount cache
+
+  [Note: 'pn' from QR ("Chai Stop") is NOT shown
+   as the authoritative name — maskName is shown]
+end note
+
+USER -> GPAY : Verifies payee name matches expected merchant\nTaps [Pay Now]
+
+' ══════════════════════════════════════════════
+' PHASE 5: ACCOUNT SELECTION
+' ══════════════════════════════════════════════
+
+== PHASE 5: Payer Bank Account Selection ==
+
+GPAY -> GPAY : Load linked accounts from\nlocal Room DB cache\n(from earlier RespListAccount)\nShows: bank name, masked ACNUM (last 6 digits),\nIFSC, account type
+
+USER -> GPAY : Confirms bank account selection\n(or uses default)
+
+' ══════════════════════════════════════════════
+' PHASE 6: PRE-PIN SETUP
+' ══════════════════════════════════════════════
+
+== PHASE 6: Pre-PIN Setup — Salt, Trust, Session ==
+
+GPAY -> PSP : Request transaction session\n[HTTPS/TLS, cert-pinned]
+
+PSP -> PSP : Generate Txn.id: "AXS20260826T142301001"\nGenerate Head.msgId: "AXS20260826142343..."\nGenerate Txn.custRef: "AXS826001"\nGenerate 16-byte random nonce (r)
+
+PSP -> PSP : Compute Trust:\nTrust = Base64(\n  AES-256-CBC(\n    key = session_token,\n    iv  = r,\n    data = SHA-256(\n      "pay|AXS20260826T142301001|\n       com.google.android.apps\n       .nbu.paisa.user|\n       919876543210|ABCDEF123456|\n       user@okaxis|\n       merchant@okhdfcbank|149.00"\n    )\n  )\n)
+
+PSP --> GPAY : { Salt: { txnId, txnAmount, deviceId,\n            appId, mobileNumber, credType,\n            payerAddr, payeeAddr,\n            random: Base64(r) },\n  Trust: "<AES-CBC hash>",\n  xmlPayload: "<signed NPCI XML config\n               containing NPCI RSA-2048 pubkey,\n               ki=20150822>" }
+
+' ══════════════════════════════════════════════
+' PHASE 7: CL SESSION ESTABLISHMENT
+' ══════════════════════════════════════════════
+
+== PHASE 7: CL Session Establishment — k0 Challenge ==
+
+GPAY -> CL : getCredential(\n  salt = Salt_JSON,\n  trust = Trust,\n  txnId = "AXS20260826T142301001",\n  xmlPayload = "<NPCI_config>"\n)
+
+CL -> CL : **Trust Validation (L20 check):**\nRecompute Trust from Salt fields\nIf computed ≠ provided → ERROR L20\n→ PIN screen NEVER shown
+
+CL -> CL : **Session Key Generation (k0):**\nk0 = os.urandom(32).hex()      [256-bit AES key]\ntoken = os.urandom(32).hex()    [256-bit token]\ndatak = get_random_bytes(32)    [256-bit AES-CBC key]\niv = get_random_bytes(16)       [128-bit IV for CBC]\ndate = "26/08/2026"             [temporal binding]
+
+CL -> CL : **Local encryption of session variables:**\nAES-CBC-encrypt(datak, iv, k0)   → k0_enc\nAES-CBC-encrypt(datak, iv, token) → token_enc\nAES-CBC-encrypt(datak, iv, date)  → date_enc\n\nGenerate ephemeral RSA-2048 key pair (local)\nRSA-OAEP(ephemeral_pub, datak)    → datak_enc
+
+CL -> CL : **RSA-OAEP Challenge Construction:**\npipe = token + "|" + k0 + "|" + device_id\nchallenge = CL_VERSION + "|" +\n  Base64(\n    RSA-OAEP-SHA256-MGF1(\n      NPCI_public_key,   ← from APK CRT file\n      pipe              ← token|k0|device_id\n    )\n  )
+
+CL -> GPAY : relay challenge to PSP
+
+GPAY -> PSP : Forward CL challenge\n[HTTPS/TLS, cert-pinned]
+
+PSP -> NPCI : ReqListKeys / GetToken\n[Mutual TLS, signed]\nBody: { challenge: "2.2|<RSA-OAEP ciphertext>" }
+
+NPCI -> NHSM : Decrypt challenge with\nNPCI RSA-2048 private key\n(HSM-internal operation)
+NHSM --> NPCI : Decrypted: token|k0|device_id\nValidate device_id against\nregistered device binding record
+NPCI --> PSP : NPCIGetTokenResponse:\nBase64(SHA256(appId|mobileNumber|deviceId))
+PSP --> GPAY : Token response
+
+GPAY -> CL : Relay NPCIGetTokenResponse
+
+CL -> CL : **Verify device binding:**\nExpected = Base64(SHA256(\n  appId + "|" + mobileNumber + "|" + deviceId\n))\nIf received ≠ expected → ABORT\n(wrong device / de-registered device)
+
+' ══════════════════════════════════════════════
+' PHASE 8: PIN ENTRY
+' ══════════════════════════════════════════════
+
+== PHASE 8: PIN Entry (CL Isolated Activity) ==
+
+CL -> CL : **Security checks before PIN screen:**\nOverlay detection (tapjacking prevention)\nAdditional root/Frida check
+
+CL -> USER : Launch pinactivitycomponent Activity\n[Isolated from Google Pay's code]\n[FLAG_SECURE recommended — prevents screenshots]\n[Custom virtual keypad — NOT Android IME]\n[No accessibility tree entries — prevents keyloggers]
+
+note right of CL
+  **PIN Screen Protection:**
+  • Custom Canvas-drawn keypad
+    (not standard Android View)
+  • No InputMethodManager involvement
+  • Touch events delivered only to CL's
+    View hierarchy — GPay cannot intercept
+  • ProGuard-obfuscated implementation
+  • Randomised key layout (INVESTIGATE)
+  • FLAG_SECURE (INVESTIGATE — mandated)
+end note
+
+USER -> CL : Enters UPI PIN (4 or 6 digits)\non CL's custom virtual keypad
+
+' ══════════════════════════════════════════════
+' PHASE 9: CRYPTOGRAPHIC CREDENTIAL CONSTRUCTION
+' ══════════════════════════════════════════════
+
+== PHASE 9: Cryptographic Credential Construction (Inside CL) ==
+
+CL -> CL : **Step 1 — Pipe String Assembly:**\npipe_string =\n  "149.00" +\n  "|AXS20260826T142301001" +\n  "|user@okaxis" +\n  "|merchant@okhdfcbank" +\n  "|com.google.android.apps.nbu.paisa.user" +\n  "|919876543210" +\n  "|ABCDEF123456" +  ← first 35 uppercase chars of device_id\n  "|pay"
+
+CL -> CL : **Step 2 — SHA-256 Hash:**\ndigest = SHA256(pipe_string.encode("UTF-8"))\n→ 32-byte transaction commitment\n(binds: amount, txnId, both VPAs,\n appId, phone, deviceId, credType)
+
+CL -> CL : **Step 3 — AES-256-GCM Encryption:**\niv = os.urandom(12)    ← 96-bit random nonce\nciphertext = AESGCM(k0).encrypt(\n  iv,\n  digest,    ← 32-byte SHA-256\n  None       ← no AAD\n)\n→ 32-byte ciphertext + 128-bit GCM auth tag\n(auth tag detects any tampering → U54 error)
+
+CL -> CL : **Step 4 — Intermediate Assembly:**\nintermediate = PIN + "|" +\n  "AXS20260826T142301001" + "|" +\n  Base64(ciphertext) + "|" +\n  Base64(iv)\nExample: "1234|AXS...|<GCM_ct>|<IV>"
+
+CL -> CL : **Step 5 — RSA-2048-OAEP Final Encryption:**\nfinal_payload = "2.2|" + Base64(\n  RSA-OAEP(\n    key      = NPCI_RSA_2048_public_key,\n    hash     = SHA-256,\n    mgf      = MGF1-SHA256,\n    plaintext = intermediate\n  )\n)\n**Only NPCI HSM can decrypt this**\n**Probabilistic — same PIN → different ciphertext each time**
+
+CL -> CL : **PIN zeroed from CL memory**\n(Java String immutability caveat — INVESTIGATE\n whether char[] zeroing is implemented)
+
+CL --> GPAY : Message object\n.getData().getEncryptedBase64String()\n→ "2.2|<256-byte RSA-OAEP ciphertext, Base64>"\n**GPAY CANNOT DECRYPT THIS**\n**GPAY NEVER HELD THE PLAINTEXT PIN**
+
+note right of GPAY
+  **What Google Pay receives from CL:**
+  An opaque Base64 string.
+  No PIN. No k0. No IV. No digest.
+  Cannot be read without NPCI's RSA private key.
+  Acts as blind courier only.
+end note
+
+' ══════════════════════════════════════════════
+' PHASE 10: REQPAY CONSTRUCTION AND TRANSMISSION
+' ══════════════════════════════════════════════
+
+== PHASE 10: ReqPay Construction and Transmission ==
+
+GPAY -> PSP : POST /api/v3/transactions\n[HTTPS/TLS 1.3, cert-pinned]\nBody: AES-256-GCM encrypted JSON\n  encryptedKey: RSA-OAEP(NPCI_pub, AES_key||IV)\n  payload: AES-GCM(\n    JSON: { payeeVpa, payerVpa, amount,\n            credentialBlock: "2.2|<RSA ciphertext>",\n            deviceId, mobileNumber,\n            txnId, txnNote, refId }\n  )\n**Double encryption: App-layer AES + TLS**
+
+PSP -> PSP : **ReqPay XML Construction:**\nInsert: Head (orgId="AXS0000001", msgId, ts)\nInsert: Meta (PAYREQSTART, PAYREQEND timestamps)\nInsert: Txn (id, note, custRef, refId, refUrl, ts, type="PAY")\nInsert: Txn.RiskScores (provider="AXS", value=042)\nInsert: Payer (addr, name, Device tags, Ac, Amount)\nInsert: Payer.Creds.Cred.Data = "2.2|<RSA ciphertext>"\nInsert: Payees.Payee (addr, name, type="ENTITY", code="5814", Amount)\n\nSign entire XML: RSA-SHA256(PSP_IDRBT_private_key, XML_body)
+
+PSP -> NPCI : POST https://upi.npci.org.in/\n       upi/ReqPay/1.0/\n       urn:txnid:AXS20260826T142301001\n[Mutual TLS — Axis Bank IDRBT CA cert]\n[RSA-SHA256 message signature in header]\nBody: ReqPay XML
+
+note right of PSP
+  **Plaintext in ReqPay XML (inside TLS):**
+  • Amount: 149.00 INR
+  • Payer VPA: user@okaxis
+  • Payee VPA: merchant@okhdfcbank
+  • Txn.id: AXS20260826T142301001
+  • custRef: AXS826001
+  • Device geocode: 12.9716,77.5946
+  • Device OS: ANDROID
+  • Risk score: 042
+  • Timestamps (PAYREQSTART, PAYREQEND, ts)
+  **Application-layer encrypted (opaque):**
+  • Creds.Cred.Data: "2.2|<RSA-OAEP blob>"
+    (PIN inside AES-GCM inside RSA-OAEP)
+end note
+
+' ══════════════════════════════════════════════
+' PHASE 11: NPCI SWITCH PROCESSING
+' ══════════════════════════════════════════════
+
+== PHASE 11: NPCI Switch Processing ==
+
+NPCI -> NPCI : **Validation pipeline:**\n1. Verify PSP mTLS certificate (IDRBT CA)\n2. Verify RSA-SHA256 message signature\n3. Validate orgId == cert subject (U17/U52 check)\n4. Validate XML schema (H02–H06, T02–T07)\n5. Deduplication: Txn.id seen before? → reject\n6. Evaluate combined risk score (U16 if exceeded)\n7. NPCI FRM AI/ML rules (velocity, pattern)\n8. Transaction state: INITIATED → AUTH_REQUESTED
+
+NPCI -> NHSM : Forward credential block\n"2.2|<RSA-OAEP ciphertext>"
+NHSM -> NHSM : **RSA-2048-OAEP Decrypt:**\nUsing NPCI's private key (HSM-resident)\nRecovers plaintext:\n  "1234|AXS20260826T142301001|\n   <GCM_ciphertext>|<IV>"
+
+NHSM -> NHSM : **Cross-check 1 — Transaction ID:**\ncredential_txnId == outer ReqPay.Txn.id?\nIf mismatch → ERROR U54\n"Transaction ID in credential ≠ ReqPay"
+
+NHSM -> NHSM : **Cross-check 2 — Transaction Context:**\nDecrypt AES-GCM(k0, IV, ciphertext)\nk0 retrieved from session established\nin Phase 7 GetToken exchange\n→ recovers SHA-256(pipe_string)\nRecompute: SHA256(\n  "149.00|AXS...|user@okaxis|\n   merchant@okhdfcbank|..."\n)\nIf hash mismatch → ERROR U54\n(detects amount/VPA substitution attacks)
+
+NHSM -> NHSM : **Re-encrypt PIN for issuer bank:**\nbank_public_key = retrieve from\n  ReqListKeys registry (HDFC Bank key)\nre_encrypted = RSA_encrypt(\n  bank_public_key, PIN_plaintext\n)\n**PIN in NHSM memory: microseconds only**\n**Then zeroed**
+
+NPCI -> NPCI : **Address resolution for payee:**\n(parallel to auth flow)
+NPCI -> PAYEE_PSP : ReqAuthDetails\n[Mutual TLS]\n"Resolve merchant@okhdfcbank → account"
+
+PAYEE_PSP --> NPCI : RespAuthDetails\n<Ac addrType="ACCOUNT">\n  <Detail name="IFSC" value="HDFC0001234"/>\n  <Detail name="ACNUM" value="..."/>\n</Ac>\n**This NEVER reaches payer or payer PSP**
+
+note right of NPCI
+  **Security guarantee:**
+  Payee IFSC + ACNUM travel ONLY
+  on the NPCI ↔ Payee PSP channel.
+  Payer PSP (Axis Bank) and
+  Google Pay NEVER see payee account details.
+end note
+
+' ══════════════════════════════════════════════
+' PHASE 12: PAYER BANK PROCESSING
+' ══════════════════════════════════════════════
+
+== PHASE 12: Payer Bank — Authentication + Balance + Debit ==
+
+NPCI -> PAYER_UPI : DebitRequest\n[Mutual TLS]\n{ txn_id, account_number_encrypted,\n  ifsc, amount: 149.00,\n  mpin_block: <re-encrypted PIN for bank> }
+note right of NPCI
+  Transaction state: DEBIT_REQUESTED
+end note
+
+PAYER_UPI -> PAYER_UPI : Check account_UPI_status:\n  MPIN_LOCKED? → return ZM immediately\n  (skip HSM — counter ≥ 3)
+
+PAYER_UPI -> PAYER_HSM : Route re-encrypted PIN block
+PAYER_HSM -> PAYER_HSM : **MPIN Verification:**\nRSA-decrypt(bank_private_key, re_encrypted_block)\n→ PIN plaintext (HSM-only, microseconds)\ncomputed = SHA256(PIN || account_salt)\nstored   = retrieve_hash(account_id)\nIf computed == stored → PASS (respCode="00")\nIf mismatch → FAIL (respCode="ZM")\n  → increment mpin_failure_counter\n  → if counter ≥ 3: lock account 24h\n**PIN zeroed from HSM memory**
+
+PAYER_HSM --> PAYER_UPI : MPIN PASS / FAIL
+
+group If MPIN PASS
+  PAYER_UPI -> PAYER_CBS : **Balance check + limits:**\navailable_balance ≥ 149.00?\ndaily_UPI_total + 149.00 ≤ daily_limit?\naccount not frozen / dormant?
+
+  PAYER_CBS --> PAYER_UPI : PASS (balance=₹12,500)
+
+  PAYER_UPI -> PAYER_CBS : **DEBIT INSTRUCTION:**\nUPDATE accounts\n  SET balance = balance - 149.00\n  WHERE account_id = 'XXXX4321'\n→ Atomic write, irrevocable at CBS level
+  PAYER_CBS --> PAYER_UPI : DEBIT CONFIRMED\napprovalNum = "AWHWU9"\nRRN = "1234312121243"\n(CBS-generated authorization codes)
+
+  PAYER_UPI -> PAYER_UPI : mpin_failure_counter reset to 0\nTransaction state: DEBIT_COMPLETE
+end
+
+PAYER_UPI --> NPCI : DebitSuccess\n{ respCode:"00", approvalNum:"AWHWU9",\n  RRN:"1234312121243" }
+
+' ══════════════════════════════════════════════
+' PHASE 13: CREDIT
+' ══════════════════════════════════════════════
+
+== PHASE 13: Payee Bank — Credit ==
+
+NPCI -> NPCI : Transaction state: DEBITED → CREDIT_REQUESTED
+NPCI -> PAYEE_CBS : CreditRequest\n[Mutual TLS]\n{ account: resolved_ACNUM,\n  ifsc: "HDFC0001234",\n  amount: 149.00,\n  txn_id: "AXS20260826T142301001" }
+
+PAYEE_CBS -> PAYEE_CBS : Validate account status (not frozen)\nCREDIT INSTRUCTION:\nUPDATE accounts\n  SET balance = balance + 149.00\n  WHERE account_id = payee_ACNUM
+
+PAYEE_CBS --> NPCI : CREDIT CONFIRMED\napprovalNum = "ESOP61"\n(payee bank's CBS authorization code)
+
+NPCI -> NPCI : Transaction state: SUCCESS
+
+' ══════════════════════════════════════════════
+' PHASE 14: RESPONSE CONSTRUCTION & PROPAGATION
+' ══════════════════════════════════════════════
+
+== PHASE 14: RespPay Construction and Propagation ==
+
+NPCI -> PSP : RespPay XML\n[Mutual TLS, signed by NPCI orgId="npci"]
+note right of NPCI
+  **RespPay XML (NPCI → PSP):**
+  <Head orgId="npci" msgId="2"
+        ts="2026-08-26T14:23:47+05:30"/>
+  <Txn id="AXS20260826T142301001"
+       ts="2026-08-26T14:23:42+05:30"
+       type="PAY"/>
+  <Resp reqMsgId="AXS20260826142343..."
+        result="SUCCESS" errCode="">
+    <Ref type="PAYER"
+         addr="user@okaxis"
+         regName="Rahul Sharma"
+         settAmount="149.00"
+         approvalNum="AWHWU9"
+         respCode="00"/>
+    <Ref type="PAYEE"
+         addr="merchant@okhdfcbank"
+         regName="Chai Stop Pvt Ltd"
+         settAmount="149.00"
+         approvalNum="ESOP61"
+         respCode="00"/>
+  </Resp>
+
+  regName = "Actual Name per Bank Records"
+  (§11.2.8 NPCI API Descriptions)
+  Two approvalNums: one per bank CBS
+end note
+
+NPCI -> PAYEE_PSP : ReqTxnConfirmation\n[Mutual TLS]\n{ orgStatus:"SUCCESS",\n  Ref[PAYEE]: addr, settAmount, approvalNum }
+
+PAYEE_PSP --> NPCI : RespTxnConfirmation
+
+PSP -> PSP : Store RespPay in TPAP/channel response table\n(keyed by Head.msgId for correlation)
+
+GPAY -> PSP : Query Service poll\n"Status of msgId=AXS20260826142343...?"
+
+PSP --> GPAY : { result: "SUCCESS",\n  payerApprovalNum: "AWHWU9",\n  payeeApprovalNum: "ESOP61",\n  payeeName: "Chai Stop Pvt Ltd",\n  settAmount: "149.00",\n  txnId: "AXS20260826T142301001",\n  txnRef: "CHAI20260826T0900Z001",\n  custRef: "AXS826001" }
+
+' ══════════════════════════════════════════════
+' PHASE 15: MERCHANT RESPONSE (tezResponse)
+' ══════════════════════════════════════════════
+
+== PHASE 15: Merchant Response Signing (Merchant Integration Only) ==
+
+GPAY -> GPAY : Assemble tezResponse JSON:\n{ "Status":"SUCCESS",\n  "amount":"149.00",\n  "txnRef":"CHAI20260826T0900Z001",\n  "toVpa":"merchant@okhdfcbank",\n  "txnId":"AXS20260826T142301001",\n  "responseCode":"00" }
+
+GPAY -> GPAY : sign = RSA_sign(\n  GooglePay_server_private_key,\n  tezResponse_JSON_string\n)
+
+GPAY -> MERCHANT : onActivityResult:\n{ tezResponse: "<JSON string>",\n  signature: "<RSA signature>",\n  signatureKeyId: "<key ID>" }
+
+MERCHANT -> MERCHANT : **Server-side verification (mandatory):**\nVerify signature using\n  Google Pay public key[signatureKeyId]\nCross-check txnId with PSP/bank backend\n**Must NOT fulfil order on app-side check only**
+
+' ══════════════════════════════════════════════
+' PHASE 16: USER-FACING RESULT
+' ══════════════════════════════════════════════
+
+== PHASE 16: User-Facing Result Display ==
+
+GPAY -> USER : **SUCCESS SCREEN:**\n✓ Payment Successful\n₹149.00 paid to Chai Stop Pvt Ltd\nmerchant@okhdfcbank\nPaid from: HDFC Bank ••4321\n26 Aug 2026, 2:23 PM\nUPI Ref No: AXS826001\n\n[Share Receipt] [Done]
+
+note right of GPAY
+  **UPI Ref No = custRef (12-char)**
+  This matches "UPI Ref No AXS826001"
+  in the bank SMS and bank statement
+  (format: UPI/AXS826001/PayeeName/VPA)
+  First 9 chars after "/" in bank statement
+  = the cross-reference for bank support calls
+end note
+
+GPAY -> GPAY : **Local SQLite write (immediate):**\ntransactions.status = 'SUCCESS'\ntransactions.npci_txn_id = 'AXS20260826T142301001'\ntransactions.rrn = '1234312121243'\ntransactions.completed_at = NOW()\n**Written to AES-256-GCM encrypted DB**\n(key in AndroidKeyStore)
+
+GPAY -> GPAY : **Google backend write (async):**\ngoogleTransactionId assigned\ntransactionStatus = SUCCESS\nupiRrn stored\nlastUpdatedTime recorded\n**Retained even if user deletes history**\n**(legal compliance requirement)**
+
+' ══════════════════════════════════════════════
+' PHASE 17: BANK NOTIFICATIONS
+' ══════════════════════════════════════════════
+
+== PHASE 17: Bank Notifications (Async) ==
+
+PAYER_CBS -> USER : Bank SMS (async, ~5–30s):\n"INR 149.00 debited from A/c XX4321\n on 26-08-26 to VPA merchant@okhdfcbank.\n UPI Ref No AXS826001.\n If not done by you, call 18001800.\n -HDFC Bank"
+
+PAYEE_CBS -> MERCHANT : Credit notification:\n"INR 149.00 credited to your account\n Ref: ESOP61"
+
+' ══════════════════════════════════════════════
+' PHASE 18: FAILURE PATHS
+' ══════════════════════════════════════════════
+
+== PHASE 18: Failure Path — Wrong PIN (ZM) ==
+
+note over PAYER_HSM
+  **If MPIN FAIL:**
+  respCode = "ZM" (Invalid MPIN)
+  Generated by: Payer Bank (§3 Error Codes — BD code)
+  NOT generated by NPCI or Google Pay
+
+  RespPay.result = "FAILURE"
+  RespPay.errCode = "ZM"
+  No debit posted — balance unchanged
+  No reversal needed
+
+  Google Pay shows:
+  "Incorrect UPI PIN. X attempt(s) remaining."
+  After 3rd: "UPI PIN blocked.
+  Wait 24h or reset via debit card."
+end note
+
+== PHASE 18b: Failure Path — Bank Timeout (DEEMED) ==
+
+note over NPCI
+  **If credit leg times out (DEEMED):**
+  result = "DEEMED"
+  (Payer debited; payee credit unknown)
+
+  Google Pay fires ReqChkTxn:
+  → Max 3 attempts, 90-second intervals
+  → (NPCI April 2025 throttling mandate)
+
+  If unresolved → UDIR auto-resolution
+  → P2P: T+1 auto-reversal (RBI/2019-20/67)
+  → P2M: T+5 auto-reversal
+  → ₹100/day compensation for delay
+
+  TD error codes (NPCI §4):
+  BT = Beneficiary timeout
+  U67 = Debit timeout
+  U68 = Credit timeout
+  91 = Transaction timeout (most common TD)
+end note
+
+== PHASE 18c: Failure Path — Insufficient Balance (Z9) ==
+
+note over PAYER_CBS
+  **If balance check fails:**
+  Z9 = "Insufficient funds"
+  Generated by: Payer Bank (§3 Error Codes — BD code)
+  NOT by Google Pay or NPCI
+
+  No debit posted.
+  Google Pay shows:
+  "Payment failed. Insufficient balance."
+  Most common failure codes (Google data):
+  ZM >50%, Z9 second, 91 (timeout) third
+end note
+
+' ══════════════════════════════════════════════
+' PHASE 19: SETTLEMENT (END-OF-DAY)
+' ══════════════════════════════════════════════
+
+== PHASE 19: End-of-Day Net Settlement ==
+
+NPCI -> NPCI : Calculate net positions\nacross all member banks\nHDFC net debit / ICICI net credit\nfor the day's batch
+
+NPCI -> NPCI : Prefunded Settlement Guarantee\nAccount (PSGA) at RBI guarantees\ninstant credit even before settlement
+
+note over NPCI
+  **Why credit appears instant:**
+  NPCI guarantees the credit via PSGA.
+  Each member bank pre-deposits collateral at RBI.
+  Actual inter-bank fund movement via
+  RBI RTGS settles end-of-day.
+  This is Two-Phase Commit (2PC) semantics:
+  Phase 1: Vote (both banks agree)
+  Phase 2: Commit (NPCI coordinates)
+end note
+
+@enduml

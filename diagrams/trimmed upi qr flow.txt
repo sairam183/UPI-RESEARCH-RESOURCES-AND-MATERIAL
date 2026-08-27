@@ -1,0 +1,55 @@
+sequenceDiagram
+    autonumber
+
+    actor U as User
+    participant APP as UPI App
+    participant CL as NPCI Common Library
+    participant PSP as PSP
+    participant NPCI as NPCI Switch
+    participant BANK as Payer Bank
+    participant CBS as Bank CBS
+    participant M as Merchant
+
+    Note over U,APP: 1. QR & VALIDATION
+
+    U->>APP: Scan QR
+    APP->>APP: Decode + validate QR
+    APP->>PSP: Resolve VPA
+    PSP->>NPCI: ReqValAdd
+    NPCI-->>PSP: Verified payee
+    PSP-->>APP: Verified name
+
+    Note over U,CL: 2. PIN & CREDENTIAL PROTECTION
+
+    U->>APP: Confirm payment
+    APP->>CL: Request credential
+    CL->>CL: Generate transaction digest
+    CL->>CL: AES-GCM encrypt digest
+    CL->>CL: RSA-OAEP encrypt credential
+    CL-->>APP: Opaque credential
+
+    Note over APP,NPCI: 3. SECURE TRANSMISSION
+
+    APP->>PSP: Encrypted payment request
+    PSP->>NPCI: ReqPay over mTLS
+    NPCI->>NPCI: Validate + risk checks
+
+    Note over NPCI,BANK: 4. BANK AUTHENTICATION
+
+    NPCI->>BANK: Debit request
+    BANK->>BANK: Authenticate PIN
+    BANK->>CBS: Balance + debit
+    CBS-->>BANK: Debit confirmed
+    BANK-->>NPCI: DebitSuccess
+
+    Note over NPCI,CBS: 5. CREDIT & RESPONSE
+
+    NPCI->>CBS: Credit payee
+    CBS-->>NPCI: Credit confirmed
+    NPCI-->>PSP: RespPay SUCCESS
+    PSP-->>APP: Transaction SUCCESS
+
+    Note over APP,M: 6. COMPLETION
+
+    APP->>M: Signed transaction response
+    APP->>U: Payment Successful
